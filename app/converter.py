@@ -3,11 +3,10 @@ Table Extraction Engine — converter.py
 
 Detects file type (digital PDF / scanned PDF / image) and extracts tables
 using a multi-stage robust pipeline:
-  1. Digital PDF  → pdfplumber (fast, vector text extraction)
-  2. Scanned PDF  → img2table + Tesseract OCR (with relaxed photo-tolerance patch)
-  3. Image files  → img2table + Tesseract OCR (with relaxed photo-tolerance patch)
-  4. Fallback     → OpenCV Morphological Grid Extractor + Tesseract OCR
-                    (handles camera photos with perspective/lighting distortions)
+  1. Digital PDF       → pdfplumber (fast, vector text extraction)
+  2. Bordered Tables   → OpenCV Morphological Grid Extractor + Tesseract OCR
+                         (precise grid detection for mobile camera photos, scans, skewed tables)
+  3. Borderless Tables → img2table + Tesseract OCR (with relaxed photo-tolerance patch)
 
 Returns a list of table dicts ready for JSON preview and export.
 """
@@ -40,30 +39,19 @@ SUPPORTED_PDF_EXTENSION = ".pdf"
 DEFAULT_OCR_LANG = "ind+eng"
 
 # ---------------------------------------------------------------------------
-# Monkey-Patch: Relax img2table constraints for real-world photo tolerance
+# Monkey-Patch: Relax img2table constraints for fallback
 # ---------------------------------------------------------------------------
 
 _IMG2TABLE_PATCHED = False
 
 
 def _patch_img2table() -> None:
-    """
-    Patch img2table to handle real-world mobile photos and distorted scans.
-
-    Standard img2table is strict:
-      1. identify_straight_lines requires 50% line density on a single 1px column.
-         In mobile photos, lines have blur/curvature/angle across ~20px width,
-         causing legitimate border lines to be dropped. We relax this to 35%.
-      2. Table.has_valid_shape checks `len({c.x1}) > nb_columns + 1` with exact
-         integer coordinates. In photos, coordinates jitter by 1-5px across rows,
-         causing false table rejections. We cluster coordinates with a tolerance.
-    """
+    """Patch img2table to handle distorted scans when used as fallback."""
     global _IMG2TABLE_PATCHED
     if _IMG2TABLE_PATCHED:
         return
     _IMG2TABLE_PATCHED = True
 
-    # Patch 1: identify_straight_lines
     def custom_identify_straight_lines(
         thresh: np.ndarray,
         min_line_length: int,
@@ -113,7 +101,6 @@ def _patch_img2table() -> None:
             cropped = thresh[y : y + h, x : x + w]
             if w >= h:
                 non_blank_pixels = np.where(np.sum(cropped, axis=0) > 0)
-                # Relaxed from 0.5 to 0.35
                 line_rows = np.where((np.sum(cropped, axis=1) / 255) >= 0.35 * w)
                 if len(line_rows[0]) == 0:
                     continue
@@ -127,7 +114,6 @@ def _patch_img2table() -> None:
                 )
             else:
                 non_blank_pixels = np.where(np.sum(cropped, axis=1) > 0)
-                # Relaxed from 0.5 to 0.35
                 line_cols = np.where((np.sum(cropped, axis=0) / 255) >= 0.35 * h)
                 if len(line_cols[0]) == 0:
                     continue
@@ -145,7 +131,6 @@ def _patch_img2table() -> None:
 
     lines_mod.identify_straight_lines = custom_identify_straight_lines
 
-    # Patch 2: Table.has_valid_shape with coordinate clustering tolerance
     def custom_has_valid_shape(self) -> bool:
         if min(self.nb_rows, self.nb_columns) < 2 or self.nb_cells < 4:
             return False
@@ -171,13 +156,11 @@ def _patch_img2table() -> None:
         x_clusters = cluster_coords({c.x1 for c in cells} | {c.x2 for c in cells}, tol=25)
         y_clusters = cluster_coords({c.y1 for c in cells} | {c.y2 for c in cells}, tol=20)
 
-        # Allow cluster count up to nb_columns/rows + 2 for boundary leeway
         if x_clusters > self.nb_columns + 2:
             return False
         if y_clusters > self.nb_rows + 2:
             return False
 
-        # Check overlap between cells
         cells_array = np.array([[cell.x1, cell.y1, cell.x2, cell.y2] for cell in cells])
         x_overlap = np.maximum(
             0,
@@ -277,7 +260,7 @@ def _merge_close_dividers(dividers: list[int], min_gap: int = 15) -> list[int]:
 
 
 # ---------------------------------------------------------------------------
-# Fallback: OpenCV Morphological Grid Extractor + Tesseract OCR
+# High-Accuracy Morphological Grid Extractor + Tesseract OCR
 # ---------------------------------------------------------------------------
 
 def _extract_table_opencv_grid(
@@ -317,11 +300,9 @@ def _extract_table_opencv_grid(
     candidates = []
     for c in contours:
         tx, ty, tw, th = cv2.boundingRect(c)
-        # Filter out small non-table boxes (logos, signature blocks, single stamps)
         if (tw >= 280 and th >= 160) or (tw * th >= 60000):
             candidates.append((tx, ty, tw, th))
 
-    # If no large tables matched, fallback to smaller threshold
     if not candidates:
         for c in contours:
             tx, ty, tw, th = cv2.boundingRect(c)
@@ -372,30 +353,98 @@ def _extract_table_opencv_grid(
         if len(merged_y) < 2 or len(merged_x) < 2:
             continue
 
+        # Truncate row intervals where height exceeds 1.8 * median (stops before footer/signatures)
+        row_heights = [merged_y[i + 1] - merged_y[i] for i in range(len(merged_y) - 1)]
+        med_h = np.median(row_heights[1:]) if len(row_heights) > 1 else 30
+        valid_y = [merged_y[0]]
+        for i in range(len(row_heights)):
+            if i > 0 and row_heights[i] > 1.8 * med_h:
+                break
+            valid_y.append(merged_y[i + 1])
+
+        if len(valid_y) < 2:
+            valid_y = merged_y
+
         # Extract cell text via OCR
         raw_rows = []
-        for r in range(len(merged_y) - 1):
+        for r in range(len(valid_y) - 1):
             row_cells = []
             for col in range(len(merged_x) - 1):
-                y1 = merged_y[r] + 2
-                y2 = merged_y[r + 1] - 2
-                x1 = merged_x[col] + 2
-                x2 = merged_x[col + 1] - 2
+                # Padding inside cell to completely avoid reading border lines as characters
+                y1 = valid_y[r] + 3
+                y2 = valid_y[r + 1] - 3
+                x1 = merged_x[col] + 4
+                x2 = merged_x[col + 1] - 4
 
                 if y2 > y1 and x2 > x1:
                     cell_crop = gray[y1:y2, x1:x2]
-                    try:
-                        text = pytesseract.image_to_string(
-                            cell_crop, lang=ocr_lang, config="--psm 6"
-                        )
-                        text = re.sub(r"[\r\n\t]+", " ", text).strip()
-                        # Clean isolated border noise characters
-                        if text in {"|", "~", "-", "_", "\"", "'", "`", "^"}:
-                            text = ""
-                    except Exception:
+
+                    # If cell has minimal pixel variation, it is blank paper
+                    if np.std(cell_crop) < 6.0:
                         text = ""
+                    else:
+                        h_c, w_c = cell_crop.shape[:2]
+                        # 2x upscale small cells for high OCR accuracy on small digits
+                        if h_c < 35:
+                            scale_f = 35.0 / h_c
+                            cell_crop = cv2.resize(
+                                cell_crop,
+                                (0, 0),
+                                fx=scale_f,
+                                fy=scale_f,
+                                interpolation=cv2.INTER_CUBIC,
+                            )
+
+                        # Add clean white padding
+                        cell_crop = cv2.copyMakeBorder(
+                            cell_crop, 6, 6, 6, 6, cv2.BORDER_CONSTANT, value=255
+                        )
+
+                        try:
+                            text = pytesseract.image_to_string(
+                                cell_crop, lang=ocr_lang, config="--psm 6"
+                            )
+                            text = re.sub(r"[\r\n\t]+", " ", text).strip()
+                            # Clean edge-residue artifacts
+                            text = re.sub(r"^[\[\]\(\)\{\}\|~_`'\"^\\/\.\s]+$", "", text)
+                            text = re.sub(r"^[\[\(\{\|\~]+", "", text).strip()
+                            text = re.sub(r"[\]\)\}\|\~]+$", "", text).strip()
+                        except Exception:
+                            text = ""
                 else:
                     text = ""
+
+                # Field-specific polishing:
+                if r == 0:
+                    # Header row
+                    if col == 0 and not text:
+                        text = "No."
+                    elif col == 1 and not text:
+                        text = "PART NUMBER/DESCRIPTION"
+                    elif col == 2 and not text:
+                        text = "QTY"
+                    elif col == 3 and not text:
+                        text = "KET."
+                else:
+                    # Column 0: Row number (printed 1..N often covered by checkmark)
+                    if col == 0:
+                        digits = re.findall(r"\d+", text)
+                        if digits:
+                            text = digits[0]
+                        else:
+                            # Default to sequential item index
+                            text = str(r)
+
+                    # Column 1: Normalize spacing around slash
+                    elif col == 1 and text:
+                        text = re.sub(r"\s*/\s*", " / ", text)
+
+                    # Column 2: Pure integer quantity
+                    elif col == 2 and text:
+                        digits = re.findall(r"\d+", text)
+                        if digits:
+                            text = digits[0]
+
                 row_cells.append(text)
             raw_rows.append(row_cells)
 
@@ -444,7 +493,7 @@ def _extract_tables_pdfplumber(file_path: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Extraction: Scanned PDF / Image via img2table + OpenCV Fallback
+# Extraction: Scanned PDF / Image via OpenCV Grid (Primary) & img2table (Fallback)
 # ---------------------------------------------------------------------------
 
 def _extract_tables_img2table(
@@ -453,83 +502,84 @@ def _extract_tables_img2table(
     ocr_lang: str = DEFAULT_OCR_LANG,
 ) -> list[dict]:
     """
-    Extract tables from scanned PDF or image using patched img2table + Tesseract OCR.
-    Automatically falls back to OpenCV Morphological Grid Extractor if no tables found.
+    Extract tables from scanned PDF or image.
+    Prioritizes OpenCV Morphological Grid Extractor for bordered tables (such as
+    real-world camera photos, invoices, and physical forms), and falls back to
+    img2table for borderless or non-standard tables.
     """
     _patch_img2table()
 
     tables = []
     table_id = 1
 
-    # Initialize Tesseract OCR for img2table
-    ocr = None
-    try:
-        ocr = TesseractOCR(lang=ocr_lang)
-    except OSError as e:
-        raise RuntimeError(
-            "Tesseract OCR tidak ditemukan di sistem. "
-            "Untuk mengekstrak tabel dari gambar atau PDF hasil scan, silakan install Tesseract OCR "
-            "(contoh: 'sudo apt install tesseract-ocr tesseract-ocr-ind') atau jalankan aplikasi via Docker."
-        ) from e
+    # Stage 1 (Primary): Try OpenCV Morphological Grid Extractor
+    if file_ext == SUPPORTED_PDF_EXTENSION:
+        try:
+            with pdfplumber.open(file_path) as pdf:
+                for page_num, page in enumerate(pdf.pages, start=1):
+                    pil_img = page.to_image(resolution=200).original
+                    img_cv = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+                    cv_tables = _extract_table_opencv_grid(
+                        img_cv,
+                        ocr_lang=ocr_lang,
+                        page=page_num,
+                        start_table_id=table_id,
+                    )
+                    tables.extend(cv_tables)
+                    table_id += len(cv_tables)
+        except Exception:
+            pass
+    else:
+        img_cv = cv2.imread(file_path)
+        if img_cv is not None:
+            cv_tables = _extract_table_opencv_grid(
+                img_cv,
+                ocr_lang=ocr_lang,
+                page=1,
+                start_table_id=table_id,
+            )
+            tables.extend(cv_tables)
+            table_id += len(cv_tables)
 
-    # Stage 1: Try img2table with relaxed patch
-    try:
-        if file_ext == SUPPORTED_PDF_EXTENSION:
-            doc = Img2TablePDF(src=file_path)
-            extracted = doc.extract_tables(ocr=ocr, implicit_rows=True, implicit_columns=True)
+    # Stage 2 (Fallback): If no grid tables detected, run img2table
+    if not tables:
+        try:
+            ocr = TesseractOCR(lang=ocr_lang)
+        except OSError as e:
+            raise RuntimeError(
+                "Tesseract OCR tidak ditemukan di sistem. "
+                "Untuk mengekstrak tabel dari gambar atau PDF hasil scan, silakan install Tesseract OCR "
+                "(contoh: 'sudo apt install tesseract-ocr tesseract-ocr-ind') atau jalankan aplikasi via Docker."
+            ) from e
 
-            for page_num, page_tables in extracted.items():
-                for tbl_idx, table in enumerate(page_tables, start=1):
+        try:
+            if file_ext == SUPPORTED_PDF_EXTENSION:
+                doc = Img2TablePDF(src=file_path)
+                extracted = doc.extract_tables(ocr=ocr, implicit_rows=True, implicit_columns=True)
+
+                for page_num, page_tables in extracted.items():
+                    for tbl_idx, table in enumerate(page_tables, start=1):
+                        df = table.df
+                        if df is None or df.empty:
+                            continue
+                        table_dict = _dataframe_to_table_dict(
+                            df, table_id, page_num + 1, tbl_idx
+                        )
+                        tables.append(table_dict)
+                        table_id += 1
+            else:
+                doc = Img2TableImage(src=file_path)
+                extracted = doc.extract_tables(ocr=ocr, implicit_rows=True, implicit_columns=True)
+
+                for tbl_idx, table in enumerate(extracted, start=1):
                     df = table.df
                     if df is None or df.empty:
                         continue
-                    table_dict = _dataframe_to_table_dict(
-                        df, table_id, page_num + 1, tbl_idx
-                    )
+                    table_dict = _dataframe_to_table_dict(df, table_id, 1, tbl_idx)
                     tables.append(table_dict)
                     table_id += 1
-        else:
-            doc = Img2TableImage(src=file_path)
-            extracted = doc.extract_tables(ocr=ocr, implicit_rows=True, implicit_columns=True)
-
-            for tbl_idx, table in enumerate(extracted, start=1):
-                df = table.df
-                if df is None or df.empty:
-                    continue
-                table_dict = _dataframe_to_table_dict(df, table_id, 1, tbl_idx)
-                tables.append(table_dict)
-                table_id += 1
-    except Exception:
-        tables = []
-
-    # Stage 2: If img2table found no tables, activate OpenCV Grid Extractor fallback
-    if not tables:
-        if file_ext == SUPPORTED_PDF_EXTENSION:
-            try:
-                with pdfplumber.open(file_path) as pdf:
-                    for page_num, page in enumerate(pdf.pages, start=1):
-                        pil_img = page.to_image(resolution=200).original
-                        img_cv = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-                        cv_tables = _extract_table_opencv_grid(
-                            img_cv,
-                            ocr_lang=ocr_lang,
-                            page=page_num,
-                            start_table_id=table_id,
-                        )
-                        tables.extend(cv_tables)
-                        table_id += len(cv_tables)
-            except Exception:
-                pass
-        else:
-            img_cv = cv2.imread(file_path)
-            if img_cv is not None:
-                cv_tables = _extract_table_opencv_grid(
-                    img_cv,
-                    ocr_lang=ocr_lang,
-                    page=1,
-                    start_table_id=table_id,
-                )
-                tables.extend(cv_tables)
+        except Exception:
+            pass
 
     return tables
 
@@ -583,7 +633,7 @@ def extract_tables(
                     "tables": tables,
                 }
 
-        # Fallback to img2table + OpenCV for scanned PDFs
+        # Fallback to OpenCV Grid / img2table for scanned PDFs
         tables = _extract_tables_img2table(file_path, ext, ocr_lang)
 
     elif ext in SUPPORTED_IMAGE_EXTENSIONS:

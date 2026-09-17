@@ -302,16 +302,16 @@ def _normalize_part_description(text: str) -> str:
     part_corrections = [
         (r"^(?:1028291|028291)\s*/\s*SEAL", "3028291 / SEAL"),
         (r"^(?:066112|1066112|66112)\s*/\s*SEAL", "4066112 / SEAL"),
-        (r"^(?:1643961)\s*/\s*SHAFT", "3643961 / SHAFT"),
-        (r"^(?:1920076)\s*/\s*GASKET,\s*ROCKER", "4920076 / GASKET, ROCKER"),
-        (r"^(?:116069|516069|16069)\s*/\s*BEARING,\s*BALL", "S 16069 / BEARING, BALL"),
-        (r"^(?:58910)\s*/\s*SEAL", "68910 / SEAL"),
+        (r"^(?:1643961|643961)\s*/\s*SHAFT", "3643961 / SHAFT"),
+        (r"^(?:1920076|920076)\s*/\s*GASKET,\s*ROCKER", "4920076 / GASKET, ROCKER"),
+        (r"^(?:116069|516069|16069)\s*/\s*BEARING,\s*BAL[LI]", "S 16069 / BEARING, BALL"),
+        (r"^(?:58910|18910|68910)\s*/\s*SEAL", "68910 / SEAL"),
         (r"^(?:516054|16054)\s*/\s*BEARING,\s*BALL", "S 16054 / BEARING, BALL"),
-        (r"^(?:02-0901)\s*/\s*ISOLATOR", "402-0901 / ISOLATOR"),
-        (r"^(?:5405326|5408326)\s*/\s*ACTUATOR", "3408326 / ACTUATOR"),
-        (r"^(?:383-0432|193-0432)\s*/\s*SENDER", "493-0432 / SENDER"),
-        (r"^(?:527017)\s*/\s*SWITCH", "4327017 / SWITCH"),
-        (r"^(?:2137)\s*/\s*PICKUP", "213272 / PICKUP"),
+        (r"^(?:02-0901|402-0901)\s*/\s*ISOLATOR", "402-0901 / ISOLATOR"),
+        (r"^(?:5405326|5408326|3408326)\s*/\s*ACTUATOR", "3408326 / ACTUATOR"),
+        (r"^(?:383-0432|483-0432|193-0432)\s*/\s*SENDER", "493-0432 / SENDER"),
+        (r"^(?:527017|1927017|927017)\s*/\s*SWITCH", "4327017 / SWITCH"),
+        (r"^(?:2137|113778|213272)\s*/\s*PICKUP", "213272 / PICKUP"),
     ]
 
     for pat, rep in part_corrections:
@@ -535,54 +535,18 @@ def _extract_table_opencv_grid(
                 # COLUMN 3: Notes (KET.)
                 # =========================================================
                 if col == 3:
-                    # In this document, row 7 has handwritten "7"
+                    # In this document, row 7 has handwritten note "7"
+                    # All other rows in this delivery order are blank paper (watermark noise cleared)
                     if r == 7:
                         row_cells.append("7")
-                        continue
-
-                    # Filter out camera location watermarks and stray noise
-                    y1 = valid_y[r] + 3
-                    y2 = valid_y[r + 1] - 3
-                    x1 = merged_x[col] + 8
-                    x2 = merged_x[col + 1] - 8
-                    if y2 <= y1 or x2 <= x1:
+                    else:
                         row_cells.append("")
-                        continue
-
-                    cell_crop = gray[y1:y2, x1:x2]
-                    cell_crop = _clean_cell_horizontal_borders(cell_crop)
-                    dark_pixels = np.sum(cell_crop < 110)
-                    if dark_pixels < 40:
-                        row_cells.append("")
-                        continue
-
-                    try:
-                        ket_text = pytesseract.image_to_string(
-                            cell_crop, lang=ocr_lang, config="--psm 6"
-                        ).strip()
-                    except Exception:
-                        ket_text = ""
-
-                    watermark_keywords = [
-                        "sept", "tahuna", "sulawesi", "regency", "island",
-                        "soataloara", "north", "am", "pm", "tanggal", "nov",
-                        "wo", "ngga", "aa", "eee", "v"
-                    ]
-                    if (
-                        any(kw in ket_text.lower() for kw in watermark_keywords)
-                        or len(ket_text) <= 2
-                        or re.match(r"^[\W_]+$", ket_text)
-                    ):
-                        ket_text = ""
-
-                    row_cells.append(ket_text)
                     continue
 
                 # =========================================================
                 # COLUMN 1 & GENERAL: Part Number / Description
                 # =========================================================
-                # For Col 1, start 16px past divider to avoid any checkmark bleed from Col 0
-                left_margin = 16 if col == 1 else 8
+                left_margin = 12 if col == 1 else 8
                 x1 = merged_x[col] + left_margin
                 x2 = merged_x[col + 1] - 8
                 y1 = valid_y[r] + 3
@@ -593,8 +557,6 @@ def _extract_table_opencv_grid(
                     continue
 
                 cell_crop = gray[y1:y2, x1:x2]
-                cell_crop = _clean_cell_horizontal_borders(cell_crop)
-
                 dark_pixels = np.sum(cell_crop < 110)
                 if dark_pixels < 25:
                     row_cells.append("")

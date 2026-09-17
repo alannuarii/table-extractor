@@ -4,25 +4,38 @@ Aplikasi web self-hosted untuk mengekstrak tabel dari file **PDF** atau **Gambar
 
 ## Fitur Utama
 
-- 📄 **Ekstraksi Tabel Otomatis** — Deteksi otomatis PDF digital vs scanned, tabel bergaris maupun tanpa garis
+- 📄 **Ekstraksi Tabel Otomatis** — Deteksi otomatis PDF digital vs scanned, foto kamera, tabel bergaris maupun tanpa garis
+- 🤖 **Gemini AI Engine** — Integrasi Google Gemini AI (`gemini-2.5-flash`, tier gratis/hemat) untuk akurasi tinggi pada foto kamera, tulisan tangan/coretan, dan scan miring
 - 🖼️ **Multi-Format Input** — PDF, PNG, JPG, JPEG, WEBP
 - 📊 **Preview Interaktif** — Pratinjau tabel langsung di browser dengan navigasi tab multi-tabel
 - 🔍 **Quick Search** — Pencarian cepat dalam data tabel
 - 📥 **Export Fleksibel** — Download sebagai Excel (multi-sheet) atau CSV (ZIP jika multi-tabel)
 - 📋 **Copy to Clipboard** — Salin tabel sebagai TSV langsung ke Excel/Google Sheets
 - 🌗 **Dark/Light Mode** — Toggle tema gelap/terang
-- 🔒 **Privasi** — Semua pemrosesan berjalan lokal, tanpa API pihak ketiga
+- 🔄 **Fallback Otomatis** — Tetap bekerja offline via pdfplumber + OpenCV/Tesseract jika API key tidak diisi
 
 ## Tech Stack
 
 | Komponen | Teknologi |
 |----------|-----------|
 | Backend | FastAPI + Uvicorn |
-| Table Extraction | pdfplumber + img2table + Tesseract OCR |
+| AI Extraction | Google Gemini AI (`gemini-2.5-flash`) |
+| Local Extraction | pdfplumber + img2table + OpenCV + Tesseract OCR |
 | Data Processing | pandas + openpyxl |
 | Frontend | HTML5 + Vanilla JS + Tailwind CSS + Lucide Icons |
 | Container | Docker + Docker Compose |
 | CI/CD | Jenkins |
+
+## Konfigurasi (.env)
+
+Buat file `.env` di direktori root untuk mengaktifkan ekstraksi berbasis Gemini AI:
+
+```env
+GEMINI_API_KEY=your_gemini_api_key_here
+GEMINI_MODEL=gemini-2.5-flash
+```
+
+> **Catatan:** Model `gemini-2.5-flash` memiliki kuota Free Tier (15 RPM / gratis) dari Google AI Studio dan biaya sangat murah untuk pay-as-you-go, dengan hasil ekstraksi dokumen/gambar yang sangat presisi. Jika API key tidak diisi, aplikasi otomatis menggunakan engine lokal (pdfplumber / OpenCV / Tesseract).
 
 ## Quick Start
 

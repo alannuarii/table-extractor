@@ -24,6 +24,16 @@ pipeline {
         stage('Deploy Container') {
             steps {
                 sh '''
+                    # Deteksi konfigurasi environment / .env
+                    ENV_ARG=""
+                    if [ -f .env ]; then
+                        ENV_ARG="--env-file .env"
+                    elif [ -f /etc/table-extractor/.env ]; then
+                        ENV_ARG="--env-file /etc/table-extractor/.env"
+                    elif [ -n "${GEMINI_API_KEY}" ]; then
+                        ENV_ARG="-e GEMINI_API_KEY=${GEMINI_API_KEY}"
+                    fi
+
                     # Hentikan dan hapus container lama jika ada
                     if [ $(docker ps -a -q -f name=^/${CONTAINER_NAME}$) ]; then
                         docker stop ${CONTAINER_NAME} || true
@@ -34,6 +44,7 @@ pipeline {
                     docker run -d \
                       --name ${CONTAINER_NAME} \
                       --restart always \
+                      ${ENV_ARG} \
                       -p ${HOST_PORT}:${CONTAINER_PORT} \
                       ${IMAGE_NAME}
                 '''

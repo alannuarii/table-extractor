@@ -7,6 +7,7 @@ Serves the API endpoints for table extraction, download, and the static frontend
 import os
 import tempfile
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -14,6 +15,9 @@ from starlette.background import BackgroundTask
 
 from app.converter import extract_tables
 from app.exporter import export_to_csv_single, export_to_csv_zip, export_to_xlsx
+
+# Load environment variables (.env) if present
+load_dotenv()
 
 app = FastAPI(
     title="Table Extractor",
@@ -54,7 +58,13 @@ def _cleanup_file(path: str):
 @app.get("/api/health")
 async def healthcheck():
     """Healthcheck endpoint for monitoring and CI/CD pipelines."""
-    return {"status": "ok", "version": "1.0.0"}
+    gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    return {
+        "status": "ok",
+        "version": "1.0.0",
+        "gemini_configured": bool(gemini_key),
+        "model": os.environ.get("GEMINI_MODEL", "gemini-2.5-flash") if gemini_key else None,
+    }
 
 
 @app.post("/api/convert")
@@ -126,6 +136,7 @@ async def convert_file(
             "file_type": result["file_type"],
             "tables_count": result["tables_count"],
             "tables": result["tables"],
+            "engine": result.get("engine", "gemini-ai"),
         })
 
     except ValueError as e:

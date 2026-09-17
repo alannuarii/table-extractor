@@ -11,9 +11,14 @@ using a multi-stage robust pipeline:
 Returns a list of table dicts ready for JSON preview and export.
 """
 
+import base64
+import json
+import logging
 import os
 import re
 import tempfile
+import urllib.error
+import urllib.request
 from typing import Optional
 
 import cv2
@@ -21,6 +26,7 @@ import numpy as np
 import pandas as pd
 import pdfplumber
 import pytesseract
+from dotenv import load_dotenv
 from PIL import Image as PILImage
 from img2table.document import Image as Img2TableImage
 from img2table.document import PDF as Img2TablePDF
@@ -28,6 +34,11 @@ from img2table.ocr import TesseractOCR
 from pypdf import PdfReader
 import img2table.tables.bordered.lines as lines_mod
 from img2table.tables.types import Line, Table
+
+# Load environment variables (.env) if present
+load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -37,6 +48,7 @@ SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 SUPPORTED_PDF_EXTENSION = ".pdf"
 
 DEFAULT_OCR_LANG = "ind+eng"
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 
 # ---------------------------------------------------------------------------
 # Monkey-Patch: Relax img2table constraints for fallback
@@ -786,6 +798,148 @@ def _extract_tables_img2table(
 
 
 # ---------------------------------------------------------------------------
+# Extraction: Gemini AI Extractor (Fast, High Precision for Scans & Photos)
+# ---------------------------------------------------------------------------
+
+def _is_gemini_available() -> bool:
+    """Check if Gemini AI API key is configured in environment."""
+    return bool(os.environ.get("GEMINI_API_KEY", "").strip())
+
+
+def _extract_tables_gemini(
+    file_path: str,
+    file_ext: str,
+) -> list[dict]:
+    """
+    Extract tables using Google Gemini AI (e.g. gemini-2.5-flash).
+    Provides superior accuracy on mobile camera photos, skewed tables, handwritten
+    annotations, stamps, and complex scanned documents.
+    """
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        return []
+
+    mime_map = {
+        ".pdf": "application/pdf",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+    }
+    mime_type = mime_map.get(file_ext.lower(), "application/octet-stream")
+
+    try:
+        with open(file_path, "rb") as f:
+            b64_data = base64.b64encode(f.read()).decode("utf-8")
+
+        prompt = (
+            "You are an expert document and table extraction system.\n"
+            "Extract all tables present in the provided document or image.\n\n"
+            "Rules:\n"
+            "1. Extract every table into a structured list of tables.\n"
+            "2. For each table:\n"
+            "   - 'name': Descriptive name of the table or page (e.g. 'Tabel 1', 'Halaman 1 - Tabel 1')\n"
+            "   - 'page': Page number where the table is located (integer, 1-indexed, default 1)\n"
+            "   - 'headers': Array of column header strings\n"
+            "   - 'rows': 2D array of strings representing data rows. Every cell must be a string. Empty cells must be empty strings \"\"\n"
+            "3. Preserve the exact row and column structure. Do not skip rows or merge columns incorrectly.\n"
+            "4. For row numbering or index columns (e.g. headers like 'No.', 'No', '#', 'Item'), output the clean sequential integer ('1', '2', '3'...) even if a handwritten checkmark (✓), stamp, or line mark overlaps the number.\n"
+            "5. Transcribe all part numbers, item descriptions, quantities, and notes/remarks accurately. If remarks or notes are handwritten, capture them faithfully.\n"
+            "6. Do NOT include camera watermarks, timestamp stamps, GPS coordinates, or non-table background text.\n"
+            "7. Return ONLY a valid JSON object matching this schema:\n"
+            "{\n"
+            '  "tables": [\n'
+            "    {\n"
+            '      "name": "string",\n'
+            '      "page": 1,\n'
+            '      "headers": ["string"],\n'
+            '      "rows": [["string"]]\n'
+            "    }\n"
+            "  ]\n"
+            "}"
+        )
+
+        model = os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL).strip() or DEFAULT_GEMINI_MODEL
+        payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {"inline_data": {"mime_type": mime_type, "data": b64_data}},
+                        {"text": prompt},
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "response_mime_type": "application/json",
+                "temperature": 0.1,
+            },
+        }
+
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            res_data = json.loads(resp.read().decode("utf-8"))
+
+        candidates = res_data.get("candidates", [])
+        if not candidates:
+            return []
+
+        raw_text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
+        if raw_text.startswith("```"):
+            raw_text = re.sub(r"^```(?:json)?\s*", "", raw_text, flags=re.IGNORECASE)
+            raw_text = re.sub(r"\s*```$", "", raw_text)
+
+        parsed = json.loads(raw_text.strip())
+        tables_data = (
+            parsed.get("tables", [])
+            if isinstance(parsed, dict)
+            else (parsed if isinstance(parsed, list) else [])
+        )
+
+        tables = []
+        for idx, tbl in enumerate(tables_data, start=1):
+            headers = [str(h).strip() for h in tbl.get("headers", [])]
+            raw_rows = tbl.get("rows", [])
+            rows = []
+            for r in raw_rows:
+                if isinstance(r, list):
+                    rows.append([str(c).strip() if c is not None else "" for c in r])
+                elif isinstance(r, dict):
+                    if not headers:
+                        headers = list(r.keys())
+                    rows.append([str(r.get(h, "")).strip() for h in headers])
+
+            if not headers and not rows:
+                continue
+
+            page = tbl.get("page", 1)
+            name = tbl.get("name") or f"Halaman {page} - Tabel {idx}"
+            tables.append({
+                "id": idx,
+                "name": name,
+                "page": page,
+                "headers": headers,
+                "rows": rows,
+                "row_count": len(rows),
+                "col_count": len(headers),
+            })
+
+        return tables
+
+    except Exception as e:
+        logger.warning(
+            "Gemini AI extraction encountered an error: %s. Falling back to local OCR pipeline.",
+            e,
+        )
+        return []
+
+
+# ---------------------------------------------------------------------------
 # Main Public API
 # ---------------------------------------------------------------------------
 
@@ -805,7 +959,8 @@ def extract_tables(
         {
             "file_type": "pdf" | "image",
             "tables_count": int,
-            "tables": [ ... ]
+            "tables": [ ... ],
+            "engine": str
         }
 
     Raises:
@@ -814,6 +969,7 @@ def extract_tables(
     """
     _, ext = os.path.splitext(file_path)
     ext = ext.lower()
+    engine_used = "tesseract-opencv"
 
     if ext == SUPPORTED_PDF_EXTENSION:
         file_type = "pdf"
@@ -824,7 +980,7 @@ def extract_tables(
                 "Silakan buka kunci PDF terlebih dahulu sebelum mengonversi."
             )
 
-        # Digital extraction first (fast path)
+        # Digital extraction first (fast path for digital vector PDFs)
         if _is_digital_pdf(file_path):
             tables = _extract_tables_pdfplumber(file_path)
             if tables:
@@ -832,14 +988,40 @@ def extract_tables(
                     "file_type": file_type,
                     "tables_count": len(tables),
                     "tables": tables,
+                    "engine": "pdfplumber",
+                }
+
+        # If scanned PDF: try Gemini AI first if configured
+        if _is_gemini_available():
+            tables = _extract_tables_gemini(file_path, ext)
+            if tables:
+                return {
+                    "file_type": file_type,
+                    "tables_count": len(tables),
+                    "tables": tables,
+                    "engine": "gemini-ai",
                 }
 
         # Fallback to OpenCV Grid / img2table for scanned PDFs
         tables = _extract_tables_img2table(file_path, ext, ocr_lang)
+        engine_used = "tesseract-opencv"
 
     elif ext in SUPPORTED_IMAGE_EXTENSIONS:
         file_type = "image"
+        # Try Gemini AI first if configured
+        if _is_gemini_available():
+            tables = _extract_tables_gemini(file_path, ext)
+            if tables:
+                return {
+                    "file_type": file_type,
+                    "tables_count": len(tables),
+                    "tables": tables,
+                    "engine": "gemini-ai",
+                }
+
+        # Fallback to OpenCV Grid / img2table
         tables = _extract_tables_img2table(file_path, ext, ocr_lang)
+        engine_used = "tesseract-opencv"
 
     else:
         raise RuntimeError(
@@ -857,4 +1039,5 @@ def extract_tables(
         "file_type": file_type,
         "tables_count": len(tables),
         "tables": tables,
+        "engine": engine_used,
     }

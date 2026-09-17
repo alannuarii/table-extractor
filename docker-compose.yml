@@ -7,3 +7,9 @@ services:
     restart: always
     ports:
       - "3022:8000"
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.5-flash}
+    env_file:
+      - path: .env
+        required: false

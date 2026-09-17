@@ -1,0 +1,11 @@
+fastapi>=0.110.0
+uvicorn[standard]>=0.28.0
+python-multipart>=0.0.9
+img2table>=1.2.9
+pdfplumber>=0.11.0
+pytesseract>=0.3.10
+pandas>=2.2.0
+openpyxl>=3.1.2
+pypdf>=4.1.0
+pillow>=10.2.0
+opencv-python-headless>=4.9.0.80

@@ -1,0 +1,9 @@
+version: '3.8'
+
+services:
+  table-extractor:
+    build: .
+    container_name: table-extractor-app
+    restart: always
+    ports:
+      - "3022:8000"

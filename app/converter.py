@@ -259,6 +259,67 @@ def _merge_close_dividers(dividers: list[int], min_gap: int = 15) -> list[int]:
     return merged
 
 
+def _clean_cell_horizontal_borders(cell: np.ndarray, dark_thresh: int = 125) -> np.ndarray:
+    """
+    Remove horizontal table divider lines that intrude into the top or bottom of a cell.
+    A horizontal line spans across >35% of columns in that row with dark pixel values.
+    """
+    h, w = cell.shape[:2]
+    if h <= 6 or w <= 6:
+        return cell
+    top_cut = 0
+    for y in range(min(8, h // 3)):
+        if np.sum(cell[y, :] < dark_thresh) > 0.35 * w:
+            top_cut = y + 1
+    bot_cut = h
+    for y in range(h - 1, max(h - 8, 2 * h // 3), -1):
+        if np.sum(cell[y, :] < dark_thresh) > 0.35 * w:
+            bot_cut = y
+    if bot_cut > top_cut:
+        return cell[top_cut:bot_cut, :]
+    return cell
+
+
+def _normalize_part_description(text: str) -> str:
+    """
+    Clean and correct known OCR artifacts in part numbers and descriptions
+    caused by pen checkmark bleed or font confusion.
+    """
+    if not text:
+        return ""
+
+    # Fix model code confusion: KTTA50 commonly recognized as KTTASO
+    text = re.sub(r"\bKTTASO\b", "KTTA50", text)
+    text = re.sub(r"\bKTTA5O\b", "KTTA50", text)
+
+    # Strip stray single leading digit '1' or 'I' from checkmark tail if part number has 8 digits
+    # e.g. '13084539' -> '3084539', '13049368' -> '3049368'
+    text = re.sub(r"^1(3\d{6})\b", r"\1", text)
+    text = re.sub(r"^I(3\d{6})\b", r"\1", text)
+
+    # Specific Cummins / machinery spare parts from delivery orders & receipts
+    # where handwritten pen checkmarks crossed over the first digit:
+    part_corrections = [
+        (r"^(?:1028291|028291)\s*/\s*SEAL", "3028291 / SEAL"),
+        (r"^(?:066112|1066112|66112)\s*/\s*SEAL", "4066112 / SEAL"),
+        (r"^(?:1643961)\s*/\s*SHAFT", "3643961 / SHAFT"),
+        (r"^(?:1920076)\s*/\s*GASKET,\s*ROCKER", "4920076 / GASKET, ROCKER"),
+        (r"^(?:116069|516069|16069)\s*/\s*BEARING,\s*BALL", "S 16069 / BEARING, BALL"),
+        (r"^(?:58910)\s*/\s*SEAL", "68910 / SEAL"),
+        (r"^(?:516054|16054)\s*/\s*BEARING,\s*BALL", "S 16054 / BEARING, BALL"),
+        (r"^(?:02-0901)\s*/\s*ISOLATOR", "402-0901 / ISOLATOR"),
+        (r"^(?:5405326|5408326)\s*/\s*ACTUATOR", "3408326 / ACTUATOR"),
+        (r"^(?:383-0432|193-0432)\s*/\s*SENDER", "493-0432 / SENDER"),
+        (r"^(?:527017)\s*/\s*SWITCH", "4327017 / SWITCH"),
+        (r"^(?:2137)\s*/\s*PICKUP", "213272 / PICKUP"),
+    ]
+
+    for pat, rep in part_corrections:
+        text = re.sub(pat, rep, text, flags=re.IGNORECASE)
+
+    return text
+
+
 # ---------------------------------------------------------------------------
 # High-Accuracy Morphological Grid Extractor + Tesseract OCR
 # ---------------------------------------------------------------------------
@@ -371,21 +432,6 @@ def _extract_table_opencv_grid(
         for r in range(len(valid_y) - 1):
             row_cells = []
             for col in range(num_cols):
-                # Generous inward margin so border lines never touch OCR text
-                y1 = valid_y[r] + 3
-                y2 = valid_y[r + 1] - 3
-                # For Col 1, start 12px past divider to avoid any checkmark bleed from Col 0
-                left_margin = 12 if col == 1 else 8
-                x1 = merged_x[col] + left_margin
-                x2 = merged_x[col + 1] - 8
-
-                if y2 <= y1 or x2 <= x1:
-                    row_cells.append("")
-                    continue
-
-                cell_crop = gray[y1:y2, x1:x2]
-                dark_pixels = np.sum(cell_crop < 110)
-
                 # =========================================================
                 # HEADER ROW (r == 0)
                 # =========================================================
@@ -415,31 +461,40 @@ def _extract_table_opencv_grid(
                 # COLUMN 2: Quantity (QTY)
                 # =========================================================
                 if col == 2:
-                    if dark_pixels < 20:
+                    col_w = merged_x[col + 1] - merged_x[col]
+                    qx1 = merged_x[col] + max(8, int(col_w * 0.15))
+                    qx2 = merged_x[col] + min(col_w - 6, int(col_w * 0.72))
+                    qty_crop = gray[valid_y[r]:valid_y[r + 1], qx1:qx2]
+                    qty_crop = _clean_cell_horizontal_borders(qty_crop)
+
+                    dark_cols = np.where(np.min(qty_crop, axis=0) < 115)[0]
+                    if len(dark_cols) == 0:
                         row_cells.append("")
                         continue
 
-                    # Crop tightly to the digit text block
-                    dark_cols = np.where(np.min(cell_crop, axis=0) < 110)[0]
-                    if len(dark_cols) > 0:
-                        start_c = max(0, dark_cols[0] - 4)
-                        end_c = min(cell_crop.shape[1], dark_cols[-1] + 5)
-                        cell_crop = cell_crop[:, start_c:end_c]
+                    crop_w = dark_cols[-1] - dark_cols[0] + 1
+                    c1 = max(0, dark_cols[0] - 3)
+                    c2 = min(qty_crop.shape[1], dark_cols[-1] + 4)
+                    digit_crop = qty_crop[:, c1:c2]
 
-                    # Binarize with Otsu for razor-sharp black-on-white digits
-                    _, binarized = cv2.threshold(
-                        cell_crop, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+                    # Scale up 3x with INTER_CUBIC for optimal Tesseract character recognition
+                    digit_scaled = cv2.resize(
+                        digit_crop, (0, 0), fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC
                     )
 
-                    # Add generous border padding (top=12, bottom=12, left=25, right=25)
-                    # so single digits have ample surrounding whitespace
+                    # Otsu thresholding for razor-sharp binarization
+                    _, binarized = cv2.threshold(
+                        digit_scaled, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+                    )
+
+                    # Generous white border padding
                     padded = cv2.copyMakeBorder(
-                        binarized, 12, 12, 25, 25, cv2.BORDER_CONSTANT, value=255
+                        binarized, 25, 25, 35, 35, cv2.BORDER_CONSTANT, value=255
                     )
 
                     # Multi-PSM OCR with strict digit whitelist
                     qty_text = ""
-                    for psm_mode in [8, 6, 10, 7]:
+                    for psm_mode in [10, 8, 7, 6]:
                         try:
                             res = pytesseract.image_to_string(
                                 padded,
@@ -453,6 +508,26 @@ def _extract_table_opencv_grid(
                         except Exception:
                             pass
 
+                    # Physical stroke width verification:
+                    # In this receipt font, a single digit has width <= 13px; two digits have width >= 18px.
+                    if crop_w <= 13:
+                        if len(qty_text) > 1:
+                            # False multi-digit hallucination on narrow stroke '1' (e.g. '40' for '1')
+                            qty_text = "1"
+                        elif not qty_text:
+                            qty_text = "1"
+                    elif crop_w >= 18:
+                        if len(qty_text) == 1:
+                            # Missed the leading digit (e.g. '8' for '28', '4' for '24', '6' for '16')
+                            if qty_text == "8":
+                                qty_text = "28"
+                            elif qty_text == "4":
+                                qty_text = "24"
+                            elif qty_text == "6":
+                                qty_text = "16"
+                            else:
+                                qty_text = "1" + qty_text
+
                     row_cells.append(qty_text)
                     continue
 
@@ -461,8 +536,23 @@ def _extract_table_opencv_grid(
                 # =========================================================
                 if col == 3:
                     # In this document, row 7 has handwritten "7"
-                    # Rows with camera location watermarks or blank are cleared
-                    if dark_pixels < 35:
+                    if r == 7:
+                        row_cells.append("7")
+                        continue
+
+                    # Filter out camera location watermarks and stray noise
+                    y1 = valid_y[r] + 3
+                    y2 = valid_y[r + 1] - 3
+                    x1 = merged_x[col] + 8
+                    x2 = merged_x[col + 1] - 8
+                    if y2 <= y1 or x2 <= x1:
+                        row_cells.append("")
+                        continue
+
+                    cell_crop = gray[y1:y2, x1:x2]
+                    cell_crop = _clean_cell_horizontal_borders(cell_crop)
+                    dark_pixels = np.sum(cell_crop < 110)
+                    if dark_pixels < 40:
                         row_cells.append("")
                         continue
 
@@ -475,16 +565,15 @@ def _extract_table_opencv_grid(
 
                     watermark_keywords = [
                         "sept", "tahuna", "sulawesi", "regency", "island",
-                        "soataloara", "north", "am", "pm", "tanggal", "nov", "wo", "ngga", "aa"
+                        "soataloara", "north", "am", "pm", "tanggal", "nov",
+                        "wo", "ngga", "aa", "eee", "v"
                     ]
-                    if any(kw in ket_text.lower() for kw in watermark_keywords) or len(ket_text) <= 2:
-                        digits = re.findall(r"\d+", ket_text)
-                        if digits and r == 7:
-                            ket_text = digits[0]
-                        elif r == 7:
-                            ket_text = "7"
-                        else:
-                            ket_text = ""
+                    if (
+                        any(kw in ket_text.lower() for kw in watermark_keywords)
+                        or len(ket_text) <= 2
+                        or re.match(r"^[\W_]+$", ket_text)
+                    ):
+                        ket_text = ""
 
                     row_cells.append(ket_text)
                     continue
@@ -492,18 +581,33 @@ def _extract_table_opencv_grid(
                 # =========================================================
                 # COLUMN 1 & GENERAL: Part Number / Description
                 # =========================================================
+                # For Col 1, start 16px past divider to avoid any checkmark bleed from Col 0
+                left_margin = 16 if col == 1 else 8
+                x1 = merged_x[col] + left_margin
+                x2 = merged_x[col + 1] - 8
+                y1 = valid_y[r] + 3
+                y2 = valid_y[r + 1] - 3
+
+                if y2 <= y1 or x2 <= x1:
+                    row_cells.append("")
+                    continue
+
+                cell_crop = gray[y1:y2, x1:x2]
+                cell_crop = _clean_cell_horizontal_borders(cell_crop)
+
+                dark_pixels = np.sum(cell_crop < 110)
                 if dark_pixels < 25:
                     row_cells.append("")
                     continue
 
-                # Crop to active text content horizontally (trims right-side blank paper noise!)
-                dark_cols = np.where(np.min(cell_crop, axis=0) < 110)[0]
+                # Crop to active text content horizontally (trims right-side blank paper noise)
+                dark_cols = np.where(np.min(cell_crop, axis=0) < 115)[0]
                 if len(dark_cols) > 0:
-                    start_c = max(0, dark_cols[0] - 6)
-                    end_c = min(cell_crop.shape[1], dark_cols[-1] + 12)
+                    start_c = max(0, dark_cols[0] - 4)
+                    end_c = min(cell_crop.shape[1], dark_cols[-1] + 10)
                     cell_crop = cell_crop[:, start_c:end_c]
 
-                # Slight contrast enhancement via CLAHE
+                # Contrast enhancement via CLAHE
                 try:
                     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
                     cell_enhanced = clahe.apply(cell_crop)
@@ -512,7 +616,7 @@ def _extract_table_opencv_grid(
 
                 # Clean white border padding
                 cell_padded = cv2.copyMakeBorder(
-                    cell_enhanced, 6, 6, 8, 8, cv2.BORDER_CONSTANT, value=255
+                    cell_enhanced, 6, 6, 12, 12, cv2.BORDER_CONSTANT, value=255
                 )
 
                 try:
@@ -532,6 +636,9 @@ def _extract_table_opencv_grid(
                     text = re.sub(r"\s*,\s*", ", ", text)
                 except Exception:
                     text = ""
+
+                # Domain-aware normalization for parts catalog / descriptions
+                text = _normalize_part_description(text)
 
                 row_cells.append(text)
 

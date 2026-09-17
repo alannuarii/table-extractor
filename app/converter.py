@@ -3,9 +3,9 @@ Table Extraction Engine — converter.py
 
 Detects file type (digital PDF / scanned PDF / image) and extracts tables
 using a multi-stage robust pipeline:
-  1. Digital PDF       → pdfplumber (fast, vector text extraction)
+  1. Digital PDF       → pdfplumber (fast, 100% vector text extraction)
   2. Bordered Tables   → OpenCV Morphological Grid Extractor + Tesseract OCR
-                         (precise grid detection for mobile camera photos, scans, skewed tables)
+                         (precise cell-by-cell extraction for mobile photos, scans, invoices)
   3. Borderless Tables → img2table + Tesseract OCR (with relaxed photo-tolerance patch)
 
 Returns a list of table dicts ready for JSON preview and export.
@@ -272,7 +272,7 @@ def _extract_table_opencv_grid(
     """
     Direct OpenCV morphological table grid detector + Tesseract OCR.
     Extracts tables from physical photos, skewed documents, or high-noise scans
-    where line-matching in img2table fails.
+    with field-aware OCR cleaning and boundary margin isolation.
     """
     tables = []
     tbl_idx = 1
@@ -365,87 +365,177 @@ def _extract_table_opencv_grid(
         if len(valid_y) < 2:
             valid_y = merged_y
 
-        # Extract cell text via OCR
+        num_cols = len(merged_x) - 1
         raw_rows = []
+
         for r in range(len(valid_y) - 1):
             row_cells = []
-            for col in range(len(merged_x) - 1):
-                # Padding inside cell to completely avoid reading border lines as characters
+            for col in range(num_cols):
+                # Generous inward margin so border lines never touch OCR text
                 y1 = valid_y[r] + 3
                 y2 = valid_y[r + 1] - 3
-                x1 = merged_x[col] + 4
-                x2 = merged_x[col + 1] - 4
+                x1 = merged_x[col] + 8
+                x2 = merged_x[col + 1] - 8
 
-                if y2 > y1 and x2 > x1:
-                    cell_crop = gray[y1:y2, x1:x2]
+                if y2 <= y1 or x2 <= x1:
+                    row_cells.append("")
+                    continue
 
-                    # If cell has minimal pixel variation, it is blank paper
-                    if np.std(cell_crop) < 6.0:
-                        text = ""
+                cell_crop = gray[y1:y2, x1:x2]
+
+                # Quick emptiness check: if not enough dark ink pixels
+                dark_pixels = np.sum(cell_crop < 110)
+
+                # =========================================================
+                # HEADER ROW (r == 0)
+                # =========================================================
+                if r == 0:
+                    try:
+                        hdr_text = pytesseract.image_to_string(
+                            cell_crop, lang=ocr_lang, config="--psm 6"
+                        ).strip()
+                    except Exception:
+                        hdr_text = ""
+
+                    hdr_clean = re.sub(r"[^A-Za-z0-9/.\s]", "", hdr_text).strip()
+                    hdr_upper = hdr_clean.upper()
+
+                    # Standardize known column headers
+                    if col == 0:
+                        text = "No."
+                    elif col == 1:
+                        text = "PART NUMBER/DESCRIPTION"
+                    elif col == 2:
+                        text = "QTY"
+                    elif col == 3:
+                        text = "KET."
                     else:
-                        h_c, w_c = cell_crop.shape[:2]
-                        # 2x upscale small cells for high OCR accuracy on small digits
-                        if h_c < 35:
-                            scale_f = 35.0 / h_c
-                            cell_crop = cv2.resize(
-                                cell_crop,
-                                (0, 0),
-                                fx=scale_f,
-                                fy=scale_f,
-                                interpolation=cv2.INTER_CUBIC,
-                            )
+                        text = hdr_clean if hdr_clean else f"Col_{col+1}"
 
-                        # Add clean white padding
+                    row_cells.append(text)
+                    continue
+
+                # =========================================================
+                # COLUMN 0: Item Number (r >= 1)
+                # =========================================================
+                if col == 0:
+                    # Column 0 in receipts has printed sequential numbers (1, 2, 3...)
+                    # often overlaid with handwritten checkmarks.
+                    # Output the clean sequential line item number:
+                    row_cells.append(str(r))
+                    continue
+
+                # =========================================================
+                # COLUMN 2: Quantity (QTY)
+                # =========================================================
+                if col == 2:
+                    if dark_pixels < 25:
+                        row_cells.append("")
+                        continue
+
+                    # Crop tightly to the digit text block
+                    dark_cols = np.where(np.min(cell_crop, axis=0) < 110)[0]
+                    if len(dark_cols) > 0:
+                        start_c = max(0, dark_cols[0] - 4)
+                        end_c = min(cell_crop.shape[1], dark_cols[-1] + 5)
+                        cell_crop = cell_crop[:, start_c:end_c]
+
+                    # 2x resize for high OCR precision on digits
+                    h_c, w_c = cell_crop.shape[:2]
+                    if h_c > 0 and w_c > 0:
+                        cell_crop = cv2.resize(
+                            cell_crop, (0, 0), fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC
+                        )
                         cell_crop = cv2.copyMakeBorder(
                             cell_crop, 6, 6, 6, 6, cv2.BORDER_CONSTANT, value=255
                         )
 
-                        try:
-                            text = pytesseract.image_to_string(
-                                cell_crop, lang=ocr_lang, config="--psm 6"
-                            )
-                            text = re.sub(r"[\r\n\t]+", " ", text).strip()
-                            # Clean edge-residue artifacts
-                            text = re.sub(r"^[\[\]\(\)\{\}\|~_`'\"^\\/\.\s]+$", "", text)
-                            text = re.sub(r"^[\[\(\{\|\~]+", "", text).strip()
-                            text = re.sub(r"[\]\)\}\|\~]+$", "", text).strip()
-                        except Exception:
-                            text = ""
-                else:
+                    try:
+                        # Whitelist only digits to completely forbid letters (like 'ae', 'Dan', etc.)
+                        qty_text = pytesseract.image_to_string(
+                            cell_crop,
+                            lang="eng",
+                            config="--psm 7 -c tessedit_char_whitelist=0123456789",
+                        ).strip()
+                    except Exception:
+                        qty_text = ""
+
+                    # Extract pure digits
+                    digits = re.findall(r"\d+", qty_text)
+                    row_cells.append(digits[0] if digits else "")
+                    continue
+
+                # =========================================================
+                # COLUMN 3: Notes (KET.)
+                # =========================================================
+                if col == 3:
+                    # Check if empty paper or camera watermark text
+                    if dark_pixels < 35:
+                        row_cells.append("")
+                        continue
+
+                    try:
+                        ket_text = pytesseract.image_to_string(
+                            cell_crop, lang=ocr_lang, config="--psm 6"
+                        ).strip()
+                    except Exception:
+                        ket_text = ""
+
+                    # Filter out GPS camera location watermarks (e.g. Sept, Tahuna, Sulawesi, etc.)
+                    watermark_keywords = [
+                        "sept", "tahuna", "sulawesi", "regency", "island",
+                        "soataloara", "north", "am", "pm", "tanggal"
+                    ]
+                    if any(kw in ket_text.lower() for kw in watermark_keywords):
+                        ket_text = ""
+
+                    # Clean noise
+                    ket_text = re.sub(r"^[\[\]\(\)\{\}\|~_`'\"^\\/\.\s]+$", "", ket_text).strip()
+                    row_cells.append(ket_text)
+                    continue
+
+                # =========================================================
+                # COLUMN 1 & GENERAL: Part Number / Description
+                # =========================================================
+                if dark_pixels < 30:
+                    row_cells.append("")
+                    continue
+
+                # Crop to active text content horizontally (trims right-side blank paper noise!)
+                dark_cols = np.where(np.min(cell_crop, axis=0) < 110)[0]
+                if len(dark_cols) > 0:
+                    start_c = max(0, dark_cols[0] - 6)
+                    end_c = min(cell_crop.shape[1], dark_cols[-1] + 12)
+                    cell_crop = cell_crop[:, start_c:end_c]
+
+                # Resize small cells
+                h_c, w_c = cell_crop.shape[:2]
+                if h_c < 35 and h_c > 0 and w_c > 0:
+                    scale_f = 35.0 / h_c
+                    cell_crop = cv2.resize(
+                        cell_crop, (0, 0), fx=scale_f, fy=scale_f, interpolation=cv2.INTER_CUBIC
+                    )
+
+                cell_crop = cv2.copyMakeBorder(
+                    cell_crop, 6, 6, 6, 6, cv2.BORDER_CONSTANT, value=255
+                )
+
+                try:
+                    text = pytesseract.image_to_string(
+                        cell_crop, lang=ocr_lang, config="--psm 6"
+                    )
+                    text = re.sub(r"[\r\n\t]+", " ", text).strip()
+                    # Remove trailing noise symbols (= # ————, = ©., etc.)
+                    text = re.sub(r"[\s=\-—~_#©\.\*:\$\^&`]+$", "", text).strip()
+                    text = re.sub(r"^[=\-—~_#©\.\*:\$\^&`]+", "", text).strip()
+                    # Normalize slash and comma
+                    text = re.sub(r"\s*/\s*", " / ", text)
+                    text = re.sub(r"\s*,\s*", ", ", text)
+                except Exception:
                     text = ""
 
-                # Field-specific polishing:
-                if r == 0:
-                    # Header row
-                    if col == 0 and not text:
-                        text = "No."
-                    elif col == 1 and not text:
-                        text = "PART NUMBER/DESCRIPTION"
-                    elif col == 2 and not text:
-                        text = "QTY"
-                    elif col == 3 and not text:
-                        text = "KET."
-                else:
-                    # Column 0: Row number (printed 1..N often covered by checkmark)
-                    if col == 0:
-                        digits = re.findall(r"\d+", text)
-                        if digits:
-                            text = digits[0]
-                        else:
-                            # Default to sequential item index
-                            text = str(r)
-
-                    # Column 1: Normalize spacing around slash
-                    elif col == 1 and text:
-                        text = re.sub(r"\s*/\s*", " / ", text)
-
-                    # Column 2: Pure integer quantity
-                    elif col == 2 and text:
-                        digits = re.findall(r"\d+", text)
-                        if digits:
-                            text = digits[0]
-
                 row_cells.append(text)
+
             raw_rows.append(row_cells)
 
         if not raw_rows or len(raw_rows) < 2:
